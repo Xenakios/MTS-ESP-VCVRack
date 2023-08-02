@@ -1,6 +1,7 @@
 #include "plugin.hpp"
 #include "libMTSClient.h"
 #include <algorithm>
+#include <atomic>
 
 struct Quantizer_MTS_ESP : Module
 {
@@ -29,7 +30,7 @@ struct Quantizer_MTS_ESP : Module
     dsp::PulseGenerator pulseGenerators[16];
 
     MTSClient *mtsClient = 0;
-    std::atomic<int> tuningMode{1}; // 0 cv handled as cv, 1 cv handled as a MIDI key
+    std::atomic<int> tuningMode{0}; // 0 cv handled as cv, 1 cv handled as a MIDI key
     bool hasMaster = false;
     bool bypassed = false;
     int roundingMode = 0;
@@ -117,7 +118,7 @@ struct Quantizer_MTS_ESP : Module
                 else
                 {
                     // moved this code into a lambda so can reuse it in the other mode
-					auto qfun = [this](double inputvolts) {
+                    auto qfun = [this](double inputvolts) {
                         double freq = dsp::FREQ_C4 * pow(2., inputvolts);
                         double qf = freq;
                         unsigned char iLower, iUpper;
@@ -179,10 +180,11 @@ struct Quantizer_MTS_ESP : Module
                     else
                     {
                         // handle the incoming voltage as if it was a MIDI key
-						// so, 0 volts is 60, -1 volt 48, +1 volt 72 etc
-						float midikeyf = 60.0f + vin * 12.0f;
+                        // so, 0 volts is 60, -1 volt 48, +1 volt 72 etc
+                        float midikeyf = 60.0f + vin * 12.0f;
                         midikeyf = clamp(midikeyf, 0.0f, 127.0f);
-                        int midikeyi = midikeyf; // this floors, could maybe do proper round instead?
+                        int midikeyi =
+                            midikeyf; // this floors, could maybe do proper round instead?
                         if (!MTS_ShouldFilterNote(mtsClient, midikeyi, -1))
                         {
                             double qf = freqs[midikeyi];
@@ -190,14 +192,14 @@ struct Quantizer_MTS_ESP : Module
                             // if we go outside sane 1oct/volt range, we clamp
                             // but let's stay in tuning...
                             const double max_v = 5.0;
-							if (outcv < -max_v)
+                            if (outcv < -max_v)
                                 outcv = log(qfun(-max_v) / dsp::FREQ_C4) / ln2;
                             if (outcv > max_v)
                                 outcv = log(qfun(max_v) / dsp::FREQ_C4) / ln2;
                             // depending on the current tuning, this may go a bit under or over
-							// the range, but that's likely more acceptable than wildly
-							// out of bounds values
-							cv_out[c] = outcv;
+                            // the range, but that's likely more acceptable than wildly
+                            // out of bounds values
+                            cv_out[c] = outcv;
                         }
                     }
                 }
@@ -237,12 +239,26 @@ struct Quantizer_MTS_ESP : Module
         bypassed = true;
         Module::processBypass(args);
     }
+    json_t *dataToJson() override
+    {
+        json_t *resultJ = json_object();
+        json_object_set(resultJ, "quantize_mode", json_integer(tuningMode));
+        return resultJ;
+    }
+    void dataFromJson(json_t *root) override
+    {
+        json_t *qModeJ = json_object_get(root, "quantize_mode");
+        if (qModeJ)
+            tuningMode = json_integer_value(qModeJ);
+    }
 };
 
 struct Quantizer_MTS_ESPWidget : ModuleWidget
 {
+    Quantizer_MTS_ESP *moduleptr = nullptr;
     Quantizer_MTS_ESPWidget(Quantizer_MTS_ESP *module)
     {
+        moduleptr = module;
         setModule(module);
         setPanel(APP->window->loadSvg(asset::plugin(pluginInstance, "res/Quantizer_MTS_ESP.svg")));
 
@@ -262,6 +278,18 @@ struct Quantizer_MTS_ESPWidget : ModuleWidget
                                                    Quantizer_MTS_ESP::CV_OUT_OUTPUT));
         addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(7.526, 109.34)), module,
                                                    Quantizer_MTS_ESP::TRIGGER_OUTPUT));
+    }
+    void appendContextMenu(Menu *menu) override
+    {
+        auto scrubopt = createCheckMenuItem(
+            "Pitch input as MIDI key", "", [this]() { return moduleptr->tuningMode == 1; },
+            [this]() {
+                if (moduleptr->tuningMode == 0)
+                    moduleptr->tuningMode = 1;
+                else
+                    moduleptr->tuningMode = 0;
+            });
+        menu->addChild(scrubopt);
     }
 };
 
